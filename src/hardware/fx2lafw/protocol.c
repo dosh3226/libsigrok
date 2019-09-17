@@ -89,7 +89,8 @@ static int command_start_acquisition(const struct sr_dev_inst *sdi)
 	samplerate = devc->cur_samplerate;
 
 	/* Compute the sample rate. */
-	if (devc->sample_wide && samplerate > MAX_16BIT_SAMPLE_RATE) {
+	if (!(devc->profile->dev_caps & DEV_CAPS_FX3) &&
+	    devc->unitsize > 1 && samplerate > MAX_16BIT_SAMPLE_RATE) {
 		sr_err("Unable to sample at %" PRIu64 "Hz "
 		       "when collecting 16-bit samples.", samplerate);
 		return SR_ERR;
@@ -97,7 +98,16 @@ static int command_start_acquisition(const struct sr_dev_inst *sdi)
 
 	delay = 0;
 	cmd.flags = cmd.sample_delay_h = cmd.sample_delay_l = 0;
-	if ((SR_MHZ(48) % samplerate) == 0) {
+
+	if ((devc->profile->dev_caps & DEV_CAPS_FX3) &&
+	    (SR_MHZ(192) % samplerate) == 0) {
+		cmd.flags = CMD_START_FLAGS_CLK_192MHZ;
+		delay = SR_MHZ(192) / samplerate - 1;
+		if (delay > 0xffff)
+			delay = 0;
+	}
+
+	if (delay == 0 && (SR_MHZ(48) % samplerate) == 0) {
 		cmd.flags = CMD_START_FLAGS_CLK_48MHZ;
 		delay = SR_MHZ(48) / samplerate - 1;
 		if (delay > MAX_SAMPLE_DELAY)
@@ -110,9 +120,14 @@ static int command_start_acquisition(const struct sr_dev_inst *sdi)
 	}
 
 	sr_dbg("GPIF delay = %d, clocksource = %sMHz.", delay,
-		(cmd.flags & CMD_START_FLAGS_CLK_48MHZ) ? "48" : "30");
+	       (cmd.flags & CMD_START_FLAGS_CLK_192MHZ? "192" :
+		(cmd.flags & CMD_START_FLAGS_CLK_48MHZ) ? "48" : "30"));
 
-	if (delay <= 0 || delay > MAX_SAMPLE_DELAY) {
+	if (delay == 0 && samplerate == SR_MHZ(192) &&
+	    (cmd.flags & CMD_START_FLAGS_CLK_192MHZ)) {
+		/* Delay == 0 is ok in this case... */
+	}
+	else if (delay <= 0 || delay > MAX_SAMPLE_DELAY) {
 		sr_err("Unable to sample at %" PRIu64 "Hz.", samplerate);
 		return SR_ERR;
 	}
@@ -121,8 +136,10 @@ static int command_start_acquisition(const struct sr_dev_inst *sdi)
 	cmd.sample_delay_l = delay & 0xff;
 
 	/* Select the sampling width. */
-	cmd.flags |= devc->sample_wide ? CMD_START_FLAGS_SAMPLE_16BIT :
-		CMD_START_FLAGS_SAMPLE_8BIT;
+	cmd.flags |= devc->unitsize == 4 ? CMD_START_FLAGS_SAMPLE_32BIT :
+		(devc->unitsize == 3 ? CMD_START_FLAGS_SAMPLE_24BIT :
+		 (devc->unitsize == 2 ? CMD_START_FLAGS_SAMPLE_16BIT :
+		  CMD_START_FLAGS_SAMPLE_8BIT));
 	/* Enable CTL2 clock. */
 	cmd.flags |= (g_slist_length(devc->enabled_analog_channels) > 0) ? CMD_START_FLAGS_CLK_CTL2 : 0;
 
@@ -259,7 +276,7 @@ SR_PRIV struct dev_context *fx2lafw_dev_new(void)
 	devc->cur_samplerate = 0;
 	devc->limit_samples = 0;
 	devc->capture_ratio = 0;
-	devc->sample_wide = FALSE;
+	devc->unitsize = 1;
 	devc->stl = NULL;
 
 	return devc;
@@ -433,7 +450,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		libusb_error_name(transfer->status), transfer->actual_length);
 
 	/* Save incoming transfer before reusing the transfer struct. */
-	unitsize = devc->sample_wide ? 2 : 1;
+	unitsize = devc->unitsize;
 	cur_sample_count = transfer->actual_length / unitsize;
 
 	switch (transfer->status) {
@@ -532,14 +549,16 @@ static int configure_channels(const struct sr_dev_inst *sdi)
 	 * Use wide sampling if either any of the LA channels 8..15 is enabled,
 	 * and/or at least one analog channel is enabled.
 	 */
-	devc->sample_wide = channel_mask > 0xff || num_analog > 0;
+	devc->unitsize = channel_mask > 0xffffff? 4 :
+			 (channel_mask > 0xffff? 3 :
+			  (channel_mask > 0xff || num_analog > 0? 2 : 1));
 
 	return SR_OK;
 }
 
-static unsigned int to_bytes_per_ms(unsigned int samplerate)
+static unsigned int to_bytes_per_ms(unsigned int samplerate, unsigned int unitsize)
 {
-	return samplerate / 1000;
+	return samplerate * unitsize / 1000;
 }
 
 static size_t get_buffer_size(struct dev_context *devc)
@@ -548,10 +567,16 @@ static size_t get_buffer_size(struct dev_context *devc)
 
 	/*
 	 * The buffer should be large enough to hold 10ms of data and
-	 * a multiple of 512.
+	 * a multiple of 1024.
 	 */
-	s = 10 * to_bytes_per_ms(devc->cur_samplerate);
-	return (s + 511) & ~511;
+	s = 10 * to_bytes_per_ms(devc->cur_samplerate, devc->unitsize);
+	if (devc->unitsize == 3) {
+	  /* Make it a multiple of 3K, to make sure we have an
+	     integral number of samples */
+	  s += 3*1024;
+	  s -= s % (3*1024);
+	}
+	return (s + 1023) & ~1023;
 }
 
 static unsigned int get_number_of_transfers(struct dev_context *devc)
@@ -559,8 +584,13 @@ static unsigned int get_number_of_transfers(struct dev_context *devc)
 	unsigned int n;
 
 	/* Total buffer size should be able to hold about 500ms of data. */
-	n = (500 * to_bytes_per_ms(devc->cur_samplerate) /
+	n = (500 * to_bytes_per_ms(devc->cur_samplerate, devc->unitsize) /
 		get_buffer_size(devc));
+
+	/* But no larger than 16M */
+	unsigned int nmax = MAX_BULK_REQUEST_SIZE / get_buffer_size(devc);
+	if (n > nmax)
+		n = nmax;
 
 	if (n > NUM_SIMUL_TRANSFERS)
 		return NUM_SIMUL_TRANSFERS;
@@ -575,7 +605,7 @@ static unsigned int get_timeout(struct dev_context *devc)
 
 	total_size = get_buffer_size(devc) *
 			get_number_of_transfers(devc);
-	timeout = total_size / to_bytes_per_ms(devc->cur_samplerate);
+	timeout = total_size / to_bytes_per_ms(devc->cur_samplerate, devc->unitsize);
 	return timeout + timeout / 4; /* Leave a headroom of 25% percent. */
 }
 
