@@ -358,7 +358,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		} else {
 			if (ezusb_upload_firmware(drvc->sr_ctx, devlist[i],
 					USB_CONFIGURATION, prof->firmware,
-					(prof->dev_caps & DEV_CAPS_FX3)) == SR_OK)
+					(prof->dev_caps & DEV_CAPS_FX3)) == SR_OK) {
 				/* Store when this device's FW was updated. */
 				devc->fw_updated = g_get_monotonic_time();
 			} else {
@@ -407,14 +407,13 @@ static int dev_open(struct sr_dev_inst *sdi)
 	ret = SR_ERR;
 	if (devc->fw_updated > 0) {
 		sr_info("Waiting for device to reset.");
-		/* Takes >= 300ms for the FX2 to be gone from the USB bus. */
+		/* Takes >= 300ms for the FX2 to be gone from the USB bus.*/
 		g_usleep(300 * 1000);
 		timediff_ms = 0;
 		while (timediff_ms < MAX_RENUM_DELAY_MS) {
 			if ((ret = fx2lafw_dev_open(sdi, di)) == SR_OK)
 				break;
 			g_usleep(100 * 1000);
-
 			timediff_us = g_get_monotonic_time() - devc->fw_updated;
 			timediff_ms = timediff_us / 1000;
 			sr_spew("Waited %" PRIi64 "ms.", timediff_ms);
@@ -428,6 +427,9 @@ static int dev_open(struct sr_dev_inst *sdi)
 		sr_info("Firmware upload was not needed.");
 		ret = fx2lafw_dev_open(sdi, di);
 	}
+	/* fx2lafw_dev_open(sdi, di); */
+	/* sr_info("Firmware upload was not needed.");*/
+	/* ret = fx2lafw_dev_open(sdi, di); */
 
 	if (ret != SR_OK) {
 		sr_err("Unable to open device.");

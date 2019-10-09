@@ -86,6 +86,10 @@ ATTRS{idVendor}=="08a9", ATTRS{idProduct}=="0005", ENV{ID_SIGROK}="1"
 # fx2grok-tiny
 ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="8613", ENV{ID_SIGROK}="1"
 
+# mod
+# Add Vid and Pid of Cypress FX3 Explorer board
+ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f3", ENV{ID_SIGROK}="1"
+
 # Dangerous Prototypes Buspirate (v3)
 # ChronoVu LA8 (old VID/PID)
 # ChronoVu LA16 (old VID/PID)
